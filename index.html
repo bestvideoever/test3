@@ -367,15 +367,21 @@
     }
   }
 
-  async function isUserBusy(userId) {
+  // isUserBusy now accepts optional ignoreCallId — ignores that callId while checking current calls.
+  async function isUserBusy(userId, ignoreCallId = null) {
     try {
       const cs = await getCallState(userId);
-      if (cs && cs.status && cs.status !== 'idle') return true;
-      // also check calls entries if any active call references user
+      if (cs && cs.status && cs.status !== 'idle') {
+        // if the callState references the call we're intentionally ignoring, treat as not busy
+        if (!(ignoreCallId && cs.callId && cs.callId === ignoreCallId)) return true;
+      }
+      // also check calls entries if any active call references user (excluding ignoreCallId)
       const callsSnap = await get(ref(db, 'calls'));
       if (!callsSnap.exists()) return false;
       const calls = callsSnap.val();
       for (const k in calls) {
+        if (!Object.prototype.hasOwnProperty.call(calls, k)) continue;
+        if (ignoreCallId && k === ignoreCallId) continue; // ignore the incoming call itself
         const c = calls[k];
         if (!c) continue;
         if ((c.caller === userId || c.callee === userId) && (c.status === 'ringing' || c.status === 'connected' || c.status === 'calling')) {
@@ -681,7 +687,6 @@ function loadFriends() {
     // write incoming/<callee> and calls/<callId>
     await set(ref(db, `incoming/${currentChatFriend}`), { from: currentUserId, sdp: offer.sdp, type: offer.type, media: media, timestamp: Date.now(), callId });
     await set(ref(db, `calls/${callId}`), { caller: currentUserId, callee: currentChatFriend, status: 'ringing', timestamp: Date.now(), expiresAt: Date.now() + 15000 });
-
     // listen for answer
     safeUnsub(answerUnsub);
     const answerRefLocal = ref(db, `answers/${currentUserId}/${currentChatFriend}`);
@@ -717,7 +722,7 @@ function loadFriends() {
         }
       } catch (e) { console.warn('call timeout cleanup err', e); }
     }, 15000);
-        // UI
+    // UI
     hangupCallBtn.style.display = 'flex';
     callBar.style.display = 'none';
   }
@@ -736,11 +741,20 @@ function loadFriends() {
       const offer = snap.val();
       if (!offer || !offer.from) return;
 
-      // if already in a call or busy, mark caller's call as 'busy' and remove incoming
-      const busy = currentCallId || (await isUserBusy(currentUserId));
+      // if already in a call, auto-reject by removing that incoming (so caller gets cleared)
+      if (currentCallId) {
+        try { await remove(ref(db, `incoming/${currentUserId}`)); } catch(e){}
+        return;
+      }
+
+      // IMPORTANT: when checking "busy" for the callee, IGNORE the incoming call itself (offer.callId).
+      // This prevents treating the newly-created ringing call (the same call) as a conflict.
+      const busy = currentCallId || (await isUserBusy(currentUserId, offer.callId));
       if (busy) {
         try { await update(ref(db, `calls/${offer.callId}`), { status: 'busy' }); } catch(e){}
         try { await remove(ref(db, `incoming/${currentUserId}`)); } catch(e){}
+        // reset any callState just in case
+        try { await setCallState(currentUserId, { status: 'idle' }); } catch(e){}
         return;
       }
 
@@ -869,7 +883,7 @@ function loadFriends() {
         const callsnap = await get(ref(db, `calls/${currentCallId}`));
         if (callsnap.exists()) {
           const req = callsnap.val();
-          if (req && req.caller) {
+          if (req && req.callee) {
             try { await remove(ref(db, `incoming/${req.callee}`)); } catch(e){} // best effort
           } else {
             // fallback
@@ -896,9 +910,7 @@ function loadFriends() {
     currentCallId = null;
     currentCallPeer = null;
     callType = null;
-  }
-
-  // hangup (user pressed hang button) -> announce ended and cleanup locally
+  }// hangup (user pressed hang button) -> announce ended and cleanup locally
   async function hangupCall() {
     // determine current call status from DB (if any)
     if (!currentCallId) {
